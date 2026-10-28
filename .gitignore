@@ -1,0 +1,24 @@
+# macOS metadata
+.DS_Store
+._*
+
+# Experiment outputs (checkpoints, predictions, metrics, source snapshots)
+runs/
+
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments and editor settings
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Extracted input features; retain the original drug_graph_feat.zip archive
+/data/Drug/drug_graph_feat/

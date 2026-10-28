@@ -1,102 +1,93 @@
+"""Ordered model inputs and reproducible, disjoint response splits."""
+from collections import namedtuple
+
 import numpy as np
-import pandas as pd
 import torch
 import torch.utils.data as Data
-from graphset import *
-from scipy.sparse import coo_matrix
+from sklearn.model_selection import train_test_split
 
-def CalculateGraphFeat(feat_mat,adj_list):
+from graphset import GraphDataset, collate
+
+
+PreparedData = namedtuple('PreparedData', [
+    'drug_loader', 'cell_loader', 'train_edges', 'labels', 'masks',
+    'cell_line_ids', 'drug_ids', 'atom_shape', 'feature_names',
+])
+
+
+def CalculateGraphFeat(feat_mat, adj_list):
     assert feat_mat.shape[0] == len(adj_list)
     adj_mat = np.zeros((len(adj_list), len(adj_list)), dtype='float32')
-    for i in range(len(adj_list)):
-        nodes = adj_list[i]
-        for each in nodes:
-            adj_mat[i,int(each)] = 1
-    assert np.allclose(adj_mat,adj_mat.T)
-    x, y = np.where(adj_mat == 1)
-    adj_index = np.array(np.vstack((x, y)))
-    return [feat_mat,adj_index]
+    for i, nodes in enumerate(adj_list):
+        for node in nodes:
+            adj_mat[i, int(node)] = 1
+    assert np.allclose(adj_mat, adj_mat.T)
+    return [feat_mat, np.vstack(np.where(adj_mat == 1))]
 
-def FeatureExtract(drug_feature):
-    drug_data = [[] for item in range(len(drug_feature))]
-    for i in range(len(drug_feature)):
-        feat_mat,adj_list,_ = drug_feature.iloc[i]
-        drug_data[i] = CalculateGraphFeat(feat_mat,adj_list)
-    return drug_data
 
-def cmask(num, ratio, seed):
-    mask = np.ones(num, dtype=bool)
-    mask[0:int(ratio * num)] = False
-    np.random.seed(seed)
-    np.random.shuffle(mask)
-    return mask
+def process(drug_feature, mutation_feature, gexpr_feature, methylation_feature,
+            data_new, nb_celllines, nb_drugs, validation_fraction=0.1,
+            test_fraction=0.1, split_seed=666):
+    """Split observed pairs; only training responses enter message passing.
 
-def process(drug_feature, mutation_feature, gexpr_feature, methylation_feature, data_new, nb_celllines, nb_drugs):
-    #-----construct cell line-drug response pairs
-    cellineid = list(set([item[0] for item in data_new]));cellineid.sort()
-    pubmedid = list(set([item[1] for item in data_new]));pubmedid.sort()
-    cellmap = list(zip(cellineid,list(range(len(cellineid)))))
-    pubmedmap = list(zip(pubmedid,list(range(len(cellineid),len(cellineid)+len(pubmedid)))))
-    cellline_num = np.squeeze([[j[1] for j in cellmap if i[0]==j[0]] for i in data_new])
-    pubmed_num = np.squeeze([[j[1] for j in pubmedmap if i[1]==j[0]] for i in data_new])
-    IC_num = np.squeeze([i[2] for i in data_new])
-    allpairs = np.vstack((cellline_num,pubmed_num,IC_num)).T
-    allpairs = allpairs[allpairs[:,2].argsort()]
+    Fractions are relative to all observed pairs. Held-out partitions are
+    stratified by response label. This holds out pairs, not entire nodes.
+    """
+    if not (0 < validation_fraction < 1 and 0 < test_fraction < 1
+            and validation_fraction + test_fraction < 1):
+        raise ValueError('Validation and test fractions must be positive and sum to less than 1.')
 
-    #----drug_feature_input
-    pubid=[item[0] for item in pubmedmap]
-    drug_feature=pd.DataFrame(drug_feature).T
-    drug_feature=drug_feature.loc[pubid]
-    atom_shape=drug_feature[0][0].shape[-1]
-    drug_data = FeatureExtract(drug_feature)
-    #----cell line_feature_input
-    cellid=[item[0] for item in cellmap]
-    gexpr_feature=gexpr_feature.loc[cellid]
-    mutation_feature=mutation_feature.loc[cellid]
-    methylation_feature=methylation_feature.loc[cellid]
-    mutation = torch.from_numpy(np.array(mutation_feature,dtype='float32'))
-    mutation = torch.unsqueeze(mutation, dim=1)
-    mutation = torch.unsqueeze(mutation, dim=1)
-    gexpr = torch.from_numpy(np.array(gexpr_feature,dtype='float32'))
-    methylation = torch.from_numpy(np.array(methylation_feature,dtype='float32'))
+    cell_ids = sorted({item[0] for item in data_new})
+    drug_ids = sorted({item[1] for item in data_new})
+    if (len(cell_ids), len(drug_ids)) != (nb_celllines, nb_drugs):
+        raise ValueError('Node counts do not match the response identifiers.')
+    cell_index = {name: i for i, name in enumerate(cell_ids)}
+    drug_index = {name: i for i, name in enumerate(drug_ids)}
+    pairs = np.asarray([(cell_index[c], drug_index[d], label)
+                        for c, d, label, *_ in data_new], dtype=np.int64)
+    observed_indices = pairs[:, 0] * nb_drugs + pairs[:, 1]
+    if len(np.unique(observed_indices)) != len(pairs):
+        raise ValueError('Response pairs must be deduplicated before splitting.')
+    if not np.all(np.isin(pairs[:, 2], [-1, 1])):
+        raise ValueError('Expected response labels encoded as -1 or 1.')
 
-    #---compile training set and test set
-    drug_set = Data.DataLoader(dataset=GraphDataset(graphs_dict=drug_data),collate_fn=collate,batch_size=nb_drugs,shuffle=False)
-    cellline_set = Data.DataLoader(dataset=Data.TensorDataset(mutation,gexpr,methylation),batch_size=nb_celllines,shuffle=False)
-    use_independent_testset=True
-    if(use_independent_testset == True):
-        edge_mask = cmask(len(allpairs), 0.1, 666)
-        train = allpairs[edge_mask][:, 0:3]
-        test = allpairs[~edge_mask][:, 0:3]
-    else:
-        CV_edgemask = cmask(len(allpairs), 0.1, 666)
-        cross_validation = allpairs[CV_edgemask][:, 0:3]
-        vali_mask = cmask(len(cross_validation), 0.2, 66)
-        train = cross_validation[vali_mask][:, 0:3]
-        test = cross_validation[~vali_mask][:, 0:3]
-    train[:, 1] -= nb_celllines
-    test[:, 1] -= nb_celllines
-    train_mask = coo_matrix((np.ones(train.shape[0], dtype=bool), (train[:, 0], train[:, 1])),
-                            shape=(nb_celllines, nb_drugs)).toarray()
-    test_mask = coo_matrix((np.ones(test.shape[0], dtype=bool), (test[:, 0], test[:, 1])),
-                           shape=(nb_celllines, nb_drugs)).toarray()
-    train_mask = torch.from_numpy(train_mask).view(-1)
-    test_mask = torch.from_numpy(test_mask).view(-1)
-    if (use_independent_testset == True):
-        pos_edge = allpairs[allpairs[:, 2] == 1, 0:2]
-        neg_edge = allpairs[allpairs[:, 2] == -1, 0:2]
-    else:
-        pos_edge = cross_validation[cross_validation[:, 2] == 1, 0:2]
-        neg_edge = cross_validation[cross_validation[:, 2] == -1, 0:2]
-    pos_edge[:, 1] -= nb_celllines
-    neg_edge[:, 1] -= nb_celllines
-    label_pos = coo_matrix((np.ones(pos_edge.shape[0]), (pos_edge[:, 0], pos_edge[:, 1])),
-                           shape=(nb_celllines, nb_drugs)).toarray()
-    label_pos = torch.from_numpy(label_pos).type(torch.FloatTensor).view(-1)
-    if (use_independent_testset == True):
-        train_edge = allpairs[edge_mask]
-    else:
-        train_edge = cross_validation[vali_mask]
-    train_edge = np.vstack((train_edge, train_edge[:, [1, 0, 2]]))
+    remaining, test_rows = train_test_split(
+        np.arange(len(pairs)), test_size=test_fraction, random_state=split_seed,
+        stratify=pairs[:, 2])
+    train_rows, validation_rows = train_test_split(
+        remaining, test_size=validation_fraction / (1 - test_fraction),
+        random_state=split_seed, stratify=pairs[remaining, 2])
+    masks = {}
+    for name, rows in [('train', train_rows), ('validation', validation_rows),
+                       ('test', test_rows), ('observed', np.arange(len(pairs)))]:
+        mask = torch.zeros(nb_celllines * nb_drugs, dtype=torch.bool)
+        mask[observed_indices[rows]] = True
+        masks[name] = mask
+    labels = torch.zeros(nb_celllines * nb_drugs, dtype=torch.float32)
+    labels[observed_indices] = torch.from_numpy((pairs[:, 2] == 1).astype('float32'))
 
-    return drug_set,cellline_set,train_edge,label_pos,train_mask,test_mask,atom_shape
+    # Graph nodes are ordered as all cell lines, followed by all drugs.
+    train_edges = pairs[train_rows].copy()
+    train_edges[:, 1] += nb_celllines
+    train_edges = np.vstack((train_edges, train_edges[:, [1, 0, 2]]))
+
+    drug_data = [CalculateGraphFeat(*drug_feature[name][:2]) for name in drug_ids]
+    mutation_feature = mutation_feature.loc[cell_ids]
+    gexpr_feature = gexpr_feature.loc[cell_ids]
+    methylation_feature = methylation_feature.loc[cell_ids]
+    mutation = torch.from_numpy(mutation_feature.to_numpy(dtype='float32'))[:, None, None, :]
+    gexpr = torch.from_numpy(gexpr_feature.to_numpy(dtype='float32'))
+    methylation = torch.from_numpy(methylation_feature.to_numpy(dtype='float32'))
+    drug_loader = Data.DataLoader(
+        GraphDataset(graphs_dict=drug_data), collate_fn=collate,
+        batch_size=nb_drugs, shuffle=False)
+    cell_loader = Data.DataLoader(
+        Data.TensorDataset(mutation, gexpr, methylation), batch_size=nb_celllines, shuffle=False)
+    feature_names = {
+        'mutation': list(map(str, mutation_feature.columns)),
+        'expression': list(map(str, gexpr_feature.columns)),
+        'methylation': list(map(str, methylation_feature.columns)),
+    }
+    return PreparedData(drug_loader, cell_loader, train_edges, labels, masks,
+                        list(map(str, cell_ids)), list(map(str, drug_ids)),
+                        drug_data[0][0].shape[-1], feature_names)

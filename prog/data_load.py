@@ -3,6 +3,26 @@ import csv
 import pandas as pd
 import hickle as hkl
 import os
+import warnings
+
+
+def load_drug_graph(path):
+    """Read the original feature files with scoped legacy-reader notices.
+
+    The supplied archive uses hickle v3. Its compatibility reader emits these
+    two expected messages; leave all other warnings and load errors visible.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore', message=r'pkg_resources is deprecated as an API\..*',
+            category=UserWarning, module=r'hickle\.legacy_v3\.hickle$')
+        warnings.filterwarnings(
+            'ignore',
+            message=r"Input argument 'file_obj' appears to be a file made with hickle v3\. Using legacy load\.\.\.$",
+            category=UserWarning, module=r'hickle\.hickle$')
+        return hkl.load(path)
+
+
 def dataload(Drug_info_file, IC50_threds_file, Drug_feature_file, Cell_line_info_file, Genomic_mutation_file,
              Cancer_response_exp_file, Gene_expression_file, Methylation_file):
     #-----drug_dataload
@@ -24,9 +44,11 @@ def dataload(Drug_info_file, IC50_threds_file, Drug_feature_file, Cell_line_info
 #     '''
     drug_pubchem_id_set = []
     drug_feature = {}
-    for each in os.listdir(Drug_feature_file):
+    for each in sorted(os.listdir(Drug_feature_file)):
+        if not each.endswith('.hkl'):
+            continue
         drug_pubchem_id_set.append(each.split('.')[0])
-        feat_mat,adj_list,degree_list = hkl.load('%s/%s'%(Drug_feature_file,each))
+        feat_mat,adj_list,degree_list = load_drug_graph('%s/%s'%(Drug_feature_file,each))
         drug_feature[each.split('.')[0]] = [feat_mat,adj_list,degree_list]
     assert len(drug_pubchem_id_set)==len(drug_feature.values())
 

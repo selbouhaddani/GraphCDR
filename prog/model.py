@@ -11,7 +11,7 @@ class NodeRepresentation(nn.Module):
     def __init__(self, gcn_layer, dim_gexp, dim_methy, output, units_list=[256, 256, 256], use_relu=True, use_bn=True,
                  use_GMP=True, use_mutation=True, use_gexpr=True, use_methylation=True):
         super(NodeRepresentation, self).__init__()
-        torch.manual_seed(0)
+        self.output_channels = output
         # -------drug layers
         self.use_relu = use_relu
         self.use_bn = use_bn
@@ -22,8 +22,9 @@ class NodeRepresentation(nn.Module):
         self.use_methylation = use_methylation
         self.conv1 = SGConv(gcn_layer, units_list[0])
         self.batch_conv1 = nn.BatchNorm1d(units_list[0])
-        self.graph_conv = []
-        self.graph_bn = []
+        # Register every layer so optimizers, eval() and state_dict() see it.
+        self.graph_conv = nn.ModuleList()
+        self.graph_bn = nn.ModuleList()
         for i in range(len(units_list) - 1):
             self.graph_conv.append(SGConv(units_list[i], units_list[i + 1]))
             self.graph_bn.append(nn.BatchNorm1d((units_list[i + 1])))
@@ -44,8 +45,8 @@ class NodeRepresentation(nn.Module):
         self.fla_mut = nn.Flatten()
         self.fc_mut = nn.Linear(2010, output)
         # ------Concatenate_three omics
-        self.fcat = nn.Linear(300, output)
-        self.batchc = nn.BatchNorm1d(100)
+        self.fcat = nn.Linear(3 * output, output)
+        self.batchc = nn.BatchNorm1d(output)
         self.reset_para()
 
     def reset_para(self):
@@ -117,7 +118,8 @@ class NodeRepresentation(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, in_channels, hidden_channels):
         super(Encoder, self).__init__()
-        self.conv1 = GCNConv(in_channels, hidden_channels, cached=True)
+        # The encoder sees two graphs; their normalized adjacencies differ.
+        self.conv1 = GCNConv(in_channels, hidden_channels, cached=False)
         self.prelu1 = nn.PReLU(hidden_channels)
         # self.conv2 = GCNConv(hidden_channels, hidden_channels, cached=True)
         # self.prelu2 = nn.PReLU(hidden_channels)
@@ -151,8 +153,8 @@ class GraphCDR(nn.Module):
         self.index = index
         self.weight = Parameter(torch.Tensor(hidden_channels, hidden_channels))
         self.act = nn.Sigmoid()
-        self.fc = nn.Linear(100, 10)
-        self.fd = nn.Linear(100, 10)
+        self.fc = nn.Linear(feat.output_channels, 10)
+        self.fd = nn.Linear(feat.output_channels, 10)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -165,7 +167,9 @@ class GraphCDR(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, drug_feature, drug_adj, ibatch, mutation_data, gexpr_data, methylation_data, edge):
+    def forward(self, drug_feature, drug_adj, ibatch, mutation_data, gexpr_data, methylation_data, edge,
+                return_details=False):
+        """Keep the five-value result; optionally append complete prediction objects."""
         #---CDR_graph_edge and corrupted CDR_graph_edge
         pos_edge = torch.from_numpy(edge[edge[:, 2] == 1, 0:2].T)
         neg_edge = torch.from_numpy(edge[edge[:, 2] == -1, 0:2].T)
@@ -186,9 +190,13 @@ class GraphCDR(nn.Module):
         cellpos = torch.cat((cellpos, cellfea), 1)
         drugpos = torch.cat((drugpos, drugfea), 1)
         #---inner product
-        pos_adj = torch.matmul(cellpos, drugpos.t())
-        pos_adj = self.act(pos_adj)
-        return pos_z, neg_z, summary_pos, summary_neg, pos_adj.view(-1)
+        logits = torch.matmul(cellpos, drugpos.t())
+        pos_adj = self.act(logits)
+        result = (pos_z, neg_z, summary_pos, summary_neg, pos_adj.view(-1))
+        if return_details:
+            return result + ({'cell_embeddings': cellpos, 'drug_embeddings': drugpos,
+                              'logits': logits},)
+        return result
 
     def discriminate(self, z, summary, sigmoid=True):
         value = torch.matmul(z, torch.matmul(self.weight, summary))
